@@ -9,6 +9,7 @@
 #include "nix/util/signals.hh"
 #include "nix/util/serialise.hh"
 #include "nix/util/util.hh"
+#include "nix/util/logging.hh"
 #include "nix/util/file-system.hh"
 #include "nix/store/posix-fs-canonicalise.hh"
 
@@ -19,6 +20,8 @@
 #include <boost/regex.hpp>
 #include <queue>
 #include <thread>
+#include <atomic>
+#include <optional>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -37,6 +40,19 @@ namespace nix {
 
 static std::string gcSocketPath = "gc-socket/socket";
 static std::string gcRootsDir = "gcroots";
+
+static void logAutoGCDiagnostic(bool enabled, uint64_t requestId, std::string_view event, std::string fields = {}) noexcept
+{
+    if (!enabled)
+        return;
+    try {
+        writeToStderr(
+            "NIX_AUTO_GC pid=" + std::to_string(getpid()) + " id=" + std::to_string(requestId) + " event="
+            + std::string(event) + (fields.empty() ? "" : " " + fields) + "\n");
+    } catch (...) {
+        // Diagnostics must not change auto-GC behavior.
+    }
+}
 
 void LocalStore::addIndirectRoot(const std::filesystem::path & path)
 {
@@ -352,6 +368,14 @@ struct GCLimitReached
 
 void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 {
+    collectGarbageImpl(options, results, {});
+}
+
+void LocalStore::collectGarbageImpl(
+    GCOptions options,
+    GCResults & results,
+    const std::function<bool(GCOptions &)> & shouldCollect)
+{
     const auto & gcSettings = config->getLocalSettings().getGCSettings();
 
     bool shouldDelete = options.action == GCOptions::gcDeleteDead || options.action == GCOptions::gcDeleteSpecific;
@@ -392,6 +416,11 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
        downgrade our exclusive lock. */
     auto fdGCLock = openGCLock();
     FdLock gcLock(fdGCLock.get(), ltWrite, true, "waiting for the big garbage collector lock...");
+
+    /* Auto-GC requests can queue behind another collector. Re-evaluate
+       whether collection is still needed only after acquiring this lock. */
+    if (shouldCollect && !shouldCollect(options))
+        return;
 
     /* Synchronisation point to test ENOENT handling in
        addTempRoot(), see tests/gc-non-blocking.sh. */
@@ -853,6 +882,25 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 void LocalStore::autoGC(bool sync)
 {
 #if HAVE_STATVFS
+    static const bool debugAutoGC = getEnv("NIX_DEBUG_AUTO_GC") == "1";
+    static std::atomic<uint64_t> nextRequestId{0};
+    const bool diagnosticEnabled = debugAutoGC;
+    const auto requestId = debugAutoGC ? nextRequestId.fetch_add(1, std::memory_order_relaxed) : 0;
+    const auto requestStarted = diagnosticEnabled ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
+    auto elapsedMs = [](auto start, auto end) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    };
+    auto logDiagnostic = [diagnosticEnabled, requestId](std::string_view event, auto && makeFields) noexcept {
+        if (!diagnosticEnabled)
+            return;
+        try {
+            logAutoGCDiagnostic(diagnosticEnabled, requestId, event, makeFields());
+        } catch (...) {
+            // Diagnostics must not change auto-GC behavior.
+        }
+    };
+
     const auto & gcSettings = config->getLocalSettings().getGCSettings();
 
     static auto fakeFreeSpaceFile = getEnv("_NIX_TEST_FREE_SPACE_FILE");
@@ -899,7 +947,14 @@ void LocalStore::autoGC(bool sync)
         std::promise<void> promise;
         future = state->gcFuture = promise.get_future().share();
 
-        std::thread([promise{std::move(promise)}, this, avail, getAvail, &gcSettings]() mutable {
+        std::thread([promise{std::move(promise)}, this, avail, getAvail, &gcSettings, diagnosticEnabled,
+                        requestStarted, elapsedMs, logDiagnostic]() mutable {
+            auto queuedAt = diagnosticEnabled ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
+            std::optional<std::chrono::steady_clock::time_point> lockAcquiredAt;
+            std::optional<uint64_t> freeAtLock;
+            bool lockWasAcquired = false;
+            GCResults results;
             try {
 
                 /* Wake up any threads waiting for the auto-GC to finish. */
@@ -913,15 +968,67 @@ void LocalStore::autoGC(bool sync)
                 GCOptions options;
                 options.maxFreed = gcSettings.maxFree - avail;
 
-                printInfo("running auto-GC to free %d bytes", options.maxFreed);
+                logDiagnostic(
+                    "queued",
+                    [&] {
+                        return "free_at_request=" + std::to_string(avail)
+                            + " request_ms=" + std::to_string(elapsedMs(requestStarted, queuedAt));
+                    });
+                bool shouldCollect = false;
 
-                GCResults results;
+                collectGarbageImpl(options, results, [&](GCOptions & options) {
+                    lockWasAcquired = true;
+                    if (diagnosticEnabled)
+                        lockAcquiredAt = std::chrono::steady_clock::now();
+                    auto avail = getAvail();
+                    freeAtLock = avail;
+                    logDiagnostic(
+                        "lock-acquired",
+                        [&] {
+                            return "queue_ms=" + std::to_string(elapsedMs(queuedAt, *lockAcquiredAt))
+                                + " free_at_lock=" + std::to_string(avail);
+                        });
+                    if (avail >= gcSettings.minFree || avail >= gcSettings.maxFree)
+                        return false;
 
-                collectGarbage(options, results);
+                    options.maxFreed = gcSettings.maxFree - avail;
+                    shouldCollect = true;
+                    printInfo("running auto-GC to free %d bytes", options.maxFreed);
+                    return true;
+                });
 
-                _state->lock()->availAfterGC = getAvail();
+                auto freeAfter = getAvail();
+                _state->lock()->availAfterGC = freeAfter;
+                if (diagnosticEnabled) {
+                    auto completedAt = std::chrono::steady_clock::now();
+                    logDiagnostic(shouldCollect ? "completed" : "skipped", [&] {
+                        return "request_ms=" + std::to_string(elapsedMs(requestStarted, completedAt))
+                            + " queue_ms="
+                            + (lockAcquiredAt ? std::to_string(elapsedMs(queuedAt, *lockAcquiredAt)) : "n/a")
+                            + " post_lock_ms="
+                            + (lockAcquiredAt ? std::to_string(elapsedMs(*lockAcquiredAt, completedAt)) : "n/a")
+                            + " free_at_request=" + std::to_string(avail)
+                            + " free_at_lock=" + (freeAtLock ? std::to_string(*freeAtLock) : "n/a")
+                            + " free_after=" + std::to_string(freeAfter)
+                            + " bytes_freed=" + std::to_string(results.bytesFreed)
+                            + " paths=" + std::to_string(results.paths.size());
+                    });
+                }
 
             } catch (...) {
+                if (diagnosticEnabled) {
+                    auto failedAt = std::chrono::steady_clock::now();
+                    logDiagnostic("error", [&] {
+                        return "request_ms=" + std::to_string(elapsedMs(requestStarted, failedAt))
+                            + " queue_ms="
+                            + (lockAcquiredAt ? std::to_string(elapsedMs(queuedAt, *lockAcquiredAt)) : "n/a")
+                            + " stage=" + (lockWasAcquired ? "gc-lock-held" : "waiting-for-gc-lock")
+                            + " free_at_request=" + std::to_string(avail)
+                            + " free_at_lock=" + (freeAtLock ? std::to_string(*freeAtLock) : "n/a")
+                            + " bytes_freed=" + std::to_string(results.bytesFreed)
+                            + " paths=" + std::to_string(results.paths.size());
+                    });
+                }
                 // FIXME: we could propagate the exception to the
                 // future, but we don't really care. (what??)
                 ignoreExceptionInDestructor();
