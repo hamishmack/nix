@@ -175,6 +175,20 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
         : std::chrono::steady_clock::time_point{};
 
     if (profiling) {
+        {
+            std::string posStr0 = "«unknown»";
+            if (auto pos0 = positions[triggerPos]) {
+                std::ostringstream oss;
+                oss << pos0;
+                posStr0 = oss.str();
+            }
+            std::string drvList;
+            for (auto & d : drvs) {
+                if (!drvList.empty()) drvList += ",";
+                drvList += d.to_string(*store);
+            }
+            printMsg(lvlInfo, "IFD start pid=%d n=%d drvs=%s at %s", getpid(), drvs.size(), drvList, posStr0);
+        }
         auto results = buildStore->buildPathsWithResults(buildReqs, bmNormal, store);
 
         auto t1 = std::chrono::steady_clock::now();
@@ -246,8 +260,8 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
 
             auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
             printMsg(lvlInfo,
-                "IFD #%d: %s [%s] %dms at %s",
-                nrIFDs, ev.drvPath, ev.status, durationMs, posStr);
+                "IFD #%d: pid=%d %s [%s] %dms at %s",
+                nrIFDs, getpid(), ev.drvPath, ev.status, durationMs, posStr);
             if (!stackStr.empty())
                 printMsg(lvlInfo, "  stack:\n%s", stackStr);
         }

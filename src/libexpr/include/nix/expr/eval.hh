@@ -1068,6 +1068,11 @@ public:
 
     DocComment getDocCommentForPos(PosIdx pos);
 
+    /** Read-only IFD profiling counters (populated when
+        `profile-import-from-derivation` is on), for nix-eval-jobs tracing. */
+    unsigned long getNrIFDs() const { return nrIFDs; }
+    std::chrono::microseconds getTotalIFDTime() const { return totalIFDTime; }
+
 private:
 
     /**
